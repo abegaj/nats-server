@@ -5266,10 +5266,20 @@ func TestNoRaceJetStreamClusterDirectAccessAllPeersSubs(t *testing.T) {
 	getSubj := fmt.Sprintf(JSDirectMsgGetT, "TEST")
 	getMsg := func(key string) *nats.Msg {
 		req := []byte(fmt.Sprintf(`{"last_by_subj":%q}`, key))
-		m, err := nc.Request(getSubj, req, time.Second)
-		require_NoError(t, err)
-		require_True(t, m.Header.Get(JSSubject) == key)
-		return m
+		var lastMsg *nats.Msg
+		for i := 0; i < 5; i++ {
+			if i > 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
+			m, err := nc.Request(getSubj, req, time.Second)
+			require_NoError(t, err)
+			if m.Header.Get(JSSubject) == key {
+				return m
+			}
+			lastMsg = m
+		}
+		t.Fatalf("Invalid message: %v", lastMsg.Header)
+		return nil
 	}
 
 	// Just make sure we can succeed here.

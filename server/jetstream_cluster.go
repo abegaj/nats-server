@@ -1753,11 +1753,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	defer stopDirectMonitoring()
 
 	// This is triggered during a scale up from 1 to clustered mode. We need the new followers to catchup,
-	// similar to how we trigger the catchup mechanism post a backup/restore. It's ok to do here and preferred
-	// over waiting to be elected, this just queues it up for the new members to see first and trigger the above
-	// RAFT layer catchup mechanism.
-	if sendSnapshot && mset != nil && n != nil {
+	// similar to how we trigger the catchup mechanism post a backup/restore.
+	if sendSnapshot && isLeader && mset != nil && n != nil {
 		n.SendSnapshot(mset.stateSnapshot())
+		sendSnapshot = false
 	}
 	for {
 		select {
@@ -1792,6 +1791,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 							mset.retryMirrorConsumer()
 							continue
 						}
+						fmt.Printf("@@IK: s=%s - ### Error applying entries: %v\n", s, err)
 						// We will attempt to reset our cluster state.
 						if mset.resetClusteredState(err) {
 							aq.recycle(&ces)
@@ -1806,6 +1806,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			aq.recycle(&ces)
 		case isLeader = <-lch:
 			if isLeader {
+				if sendSnapshot && mset != nil && n != nil {
+					n.SendSnapshot(mset.stateSnapshot())
+					sendSnapshot = false
+				}
 				if isRestore {
 					acc, _ := s.LookupAccount(sa.Client.serviceAccount())
 					restoreDoneCh = s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_)
@@ -6157,9 +6161,23 @@ func (mset *stream) processSnapshot(snap *streamSnapshot) (e error) {
 	var sub *subscription
 	var err error
 
-	const activityInterval = 10 * time.Second
+	const maxActivityInterval = 10 * time.Second
+	const minActivityInterval = time.Second
+	activityInterval := minActivityInterval
 	notActive := time.NewTimer(activityInterval)
 	defer notActive.Stop()
+
+	var gotMsgs bool
+	getActivityInterval := func() time.Duration {
+		if gotMsgs || activityInterval == maxActivityInterval {
+			return maxActivityInterval
+		}
+		activityInterval *= 2
+		if activityInterval > maxActivityInterval {
+			activityInterval = maxActivityInterval
+		}
+		return activityInterval
+	}
 
 	defer func() {
 		if sub != nil {
@@ -6223,7 +6241,7 @@ RETRY:
 		default:
 		}
 	}
-	notActive.Reset(activityInterval)
+	notActive.Reset(getActivityInterval())
 
 	// Grab sync request again on failures.
 	if sreq == nil {
@@ -6269,7 +6287,8 @@ RETRY:
 	for qch, lch := n.QuitC(), n.LeadChangeC(); ; {
 		select {
 		case <-msgsQ.ch:
-			notActive.Reset(activityInterval)
+			gotMsgs = true
+			notActive.Reset(getActivityInterval())
 
 			mrecs := msgsQ.pop()
 			for _, mreci := range mrecs {
